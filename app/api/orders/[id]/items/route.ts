@@ -1,24 +1,65 @@
 import { createClient } from "@/lib/supabase/server"
 import { NextResponse } from "next/server"
 
-export async function POST(request: Request, { params }: { params: { id: string } }) {
+type RouteParams = {
+  id: string
+}
+
+export async function POST(
+  request: Request,
+  { params }: { params: Promise<RouteParams> }
+) {
   try {
+    // ✅ Next.js 15: params HARUS di-await
+    const { id: orderId } = await params
+
     const supabase = await createClient()
     const body = await request.json()
 
+    // Normalize payload
     const items = Array.isArray(body) ? body : body.items || [body]
 
-    // Calculate total amount from items
+    if (!items.length) {
+      return NextResponse.json(
+        { error: "Items payload is empty" },
+        { status: 400 }
+      )
+    }
+
+    // Calculate total amount
     let totalAmount = 0
     for (const item of items) {
-      totalAmount += item.price * item.quantity
+      totalAmount += (item.price || 0) * (item.quantity || 0)
     }
 
     // Insert order items
     for (const item of items) {
+      const itemId = item.item_id || item.id
+
+      // 🔴 HARD VALIDATION (INI YANG LO TANYA TADI)
+      if (!itemId) {
+        return NextResponse.json(
+          {
+            error: "item_id is required for each order item",
+            invalidItem: item,
+          },
+          { status: 400 }
+        )
+      }
+
+      if (!item.quantity || !item.price) {
+        return NextResponse.json(
+          {
+            error: "quantity and price are required",
+            invalidItem: item,
+          },
+          { status: 400 }
+        )
+      }
+
       const itemData = {
-        order_id: params.id,
-        item_id: item.item_id || item.id,
+        order_id: orderId,
+        item_id: itemId,
         item_name: item.item_name,
         item_type: item.item_type,
         quantity: item.quantity,
@@ -27,34 +68,51 @@ export async function POST(request: Request, { params }: { params: { id: string 
         subtotal: item.price * item.quantity,
       }
 
-      const { error: itemError } = await supabase.from("order_items").insert(itemData)
+      const { error: itemError } = await supabase
+        .from("order_items")
+        .insert(itemData)
 
       if (itemError) throw itemError
 
-      // Update product stock if it's a product
+      // Update product stock (kalau item = product)
       if (item.item_type === "product") {
-        const productId = item.item_id || item.id
+        const { data: productData, error: productError } = await supabase
+          .from("products")
+          .select("stock")
+          .eq("id", itemId)
+          .single()
 
-        const { data: productData } = await supabase.from("products").select("stock").eq("id", productId).single()
+        if (productError) throw productError
 
         if (productData) {
           const newStock = Math.max(0, productData.stock - item.quantity)
-          await supabase.from("products").update({ stock: newStock }).eq("id", productId)
+
+          const { error: updateStockError } = await supabase
+            .from("products")
+            .update({ stock: newStock })
+            .eq("id", itemId)
+
+          if (updateStockError) throw updateStockError
         }
       }
     }
 
-    // Update order total amount
+    // Update order total
     const { data, error } = await supabase
       .from("orders")
       .update({ total_amount: totalAmount })
-      .eq("id", params.id)
+      .eq("id", orderId)
       .select()
+      .single()
 
     if (error) throw error
 
-    return NextResponse.json(data[0], { status: 201 })
+    return NextResponse.json(data, { status: 201 })
   } catch (error) {
-    return NextResponse.json({ error: "Failed to add items to order" }, { status: 500 })
+    console.error("POST /api/orders/[id]/items error:", error)
+    return NextResponse.json(
+      { error: "Failed to add items to order" },
+      { status: 500 }
+    )
   }
 }
